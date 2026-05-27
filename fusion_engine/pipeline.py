@@ -15,6 +15,8 @@ from typing import Any
 
 import torch
 
+_QWEN_VLLM_ZERO_COPY_PATCH_INSTALLED = False
+
 
 def _import_fusion_core() -> Any:
     """Import the pybind11 extension from the source or common CMake build dirs."""
@@ -61,7 +63,7 @@ class LocalVisionModelConfig:
     model_id_or_path: str = "/models/local-quantized-vision-language-model"
     quantization: str = "4bit"
     dtype: str = "float16"
-    expected_input_layout: str = "NHWC RGB float32 in [0, 1]"
+    expected_input_layout: str = "Qwen2.5-VL pixel_values_videos CUDA float32 patches"
 
 
 @dataclass(frozen=True)
@@ -184,6 +186,67 @@ class CudaStreamFusionPipeline:
 
         return self.latest_hwc_tensor().unsqueeze(0)
 
+    def latest_qwen_patch_bundle(self) -> dict[str, Any]:
+        """Return zero-copy Qwen2.5-VL video patches and native metadata.
+
+        Native CUDA produces `pixel_values_videos` as a dense row-major tensor
+        with shape `[grid_t * grid_h * grid_w, 1176]`. The column dimension is
+        `3 channels * 2 temporal frames * 14 * 14`. Strides are `[1176, 1]`,
+        exactly the contiguous layout that Qwen's visual patch embedder expects.
+        """
+
+        bundle = fusion_core.get_qwen_patch_tensor()
+        info = dict(bundle["info"])
+        tensor = torch.utils.dlpack.from_dlpack(bundle["capsule"])
+        expected_shape = (int(info["rows"]), int(info["columns"]))
+        expected_stride = (int(info["columns"]), 1)
+
+        if tensor.device != self.device:
+            raise RuntimeError(f"Unexpected Qwen patch tensor device {tensor.device}; expected {self.device}.")
+        if tensor.dtype != torch.float32:
+            raise RuntimeError(f"Unexpected Qwen patch tensor dtype {tensor.dtype}; expected torch.float32.")
+        if tuple(tensor.shape) != expected_shape:
+            raise RuntimeError(f"Unexpected Qwen patch tensor shape {tuple(tensor.shape)}; expected {expected_shape}.")
+        if tuple(tensor.stride()) != expected_stride:
+            raise RuntimeError(f"Unexpected Qwen patch tensor stride {tuple(tensor.stride())}; expected {expected_stride}.")
+        if tensor.data_ptr() != int(info["ptr"]):
+            raise RuntimeError("Qwen patch tensor data pointer does not match native DLPack pointer.")
+
+        return {"tensor": tensor, "info": info}
+
+    def latest_qwen_patch_tensor(self) -> torch.Tensor:
+        """Return the latest Qwen2.5-VL `pixel_values_videos` CUDA tensor."""
+
+        return self.latest_qwen_patch_bundle()["tensor"]
+
+    def qwen_video_metadata(self, patch_info: dict[str, Any], fps: float = 30.0) -> dict[str, torch.Tensor]:
+        """Build tiny structural CPU metadata for the native Qwen patch tensor."""
+
+        if fps <= 0.0:
+            raise ValueError("fps must be positive.")
+        grid = torch.tensor(
+            [[int(patch_info["grid_t"]), int(patch_info["grid_h"]), int(patch_info["grid_w"])]],
+            dtype=torch.long,
+            device="cpu",
+        )
+        seconds = torch.tensor(
+            [float(patch_info["temporal_patch_size"]) / float(fps)],
+            dtype=torch.float32,
+            device="cpu",
+        )
+        return {"video_grid_thw": grid, "second_per_grid_ts": seconds}
+
+    def qwen_vllm_video_payload(self, fps: float = 30.0) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Package CUDA patches in vLLM's direct multimodal passthrough format."""
+
+        bundle = self.latest_qwen_patch_bundle()
+        metadata = self.qwen_video_metadata(bundle["info"], fps=fps)
+        payload = {
+            "pixel_values_videos": bundle["tensor"],
+            **metadata,
+        }
+        return payload, bundle["info"]
+
     def latest_nchw_view(self) -> torch.Tensor:
         """Return a zero-copy NCHW view for models that accept non-contiguous input.
 
@@ -240,6 +303,84 @@ def example() -> None:
     print("Audio ring metadata:", pipeline.audio_info)
     print("Model placeholder:", pipeline.run_model_step(model=None))
     print("ASR placeholder:", pipeline.run_asr_step(model=None))
+
+
+def install_vllm_qwen2_5_vl_zero_copy_patch() -> None:
+    """Patch vLLM's Qwen2.5-VL parser to accept CUDA patch tensors directly.
+
+    vLLM 0.21 accepts raw `video` tensors by routing them through a parser that
+    calls `.numpy()`, which forces CPU materialization and breaks this project’s
+    zero-copy contract. The Qwen model code already supports direct
+    `pixel_values_videos` tensors at execution time, so this runtime patch adds
+    a parser fast path for dictionaries containing native CUDA patch rows.
+    """
+
+    global _QWEN_VLLM_ZERO_COPY_PATCH_INSTALLED
+    if _QWEN_VLLM_ZERO_COPY_PATCH_INSTALLED:
+        return
+
+    try:
+        from vllm.model_executor.models import qwen2_vl  # type: ignore
+        from vllm.multimodal import MULTIMODAL_REGISTRY  # noqa: F401
+        from vllm.multimodal.inputs import MultiModalFieldConfig  # type: ignore
+        from transformers.feature_extraction_utils import BatchFeature  # type: ignore
+        from vllm.multimodal.inputs import MultiModalKwargsItems  # type: ignore
+        from vllm.multimodal.parse import ModalityDataItems  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("vLLM must be importable before installing the Qwen zero-copy patch.") from exc
+
+    parser_cls = qwen2_vl.Qwen2VLMultiModalDataParser
+    original = getattr(parser_cls, "_csf_original_parse_video_data", None)
+    if original is None:
+        original = parser_cls._parse_video_data
+        setattr(parser_cls, "_csf_original_parse_video_data", original)
+
+    class CudaStreamFusionPixelItems(ModalityDataItems[dict[str, torch.Tensor], dict[str, torch.Tensor]]):
+        """Dict passthrough that vLLM must treat as pixel values, not embeds."""
+
+        def __init__(self, data: dict[str, torch.Tensor], fields_config: dict[str, Any]) -> None:
+            super().__init__(data, "video")
+            self._kwargs = MultiModalKwargsItems.from_hf_inputs(BatchFeature(dict(data)), fields_config)
+
+        def get_count(self) -> int:
+            return len(self._kwargs["video"])
+
+        def get(self, index: int) -> dict[str, torch.Tensor]:
+            return self._kwargs["video"][index].get_data()
+
+        def get_processor_data(self) -> dict[str, object]:
+            return {}
+
+        def get_passthrough_data(self) -> dict[str, torch.Tensor]:
+            return self.data
+
+    def patched_parse_video_data(self: Any, data: Any) -> Any:
+        if isinstance(data, dict) and "pixel_values_videos" in data:
+            pixel_values = data.get("pixel_values_videos")
+            grid = data.get("video_grid_thw")
+            if not isinstance(pixel_values, torch.Tensor):
+                raise TypeError("pixel_values_videos must be a torch.Tensor.")
+            if not pixel_values.is_cuda:
+                raise TypeError("pixel_values_videos must stay on CUDA for the zero-copy path.")
+            if pixel_values.dtype != torch.float32:
+                raise TypeError("pixel_values_videos must be float32.")
+            if pixel_values.ndim != 2 or pixel_values.shape[1] != 1176:
+                raise ValueError(
+                    "pixel_values_videos must have shape [num_patches, 1176] for Qwen2.5-VL."
+                )
+            if not isinstance(grid, torch.Tensor) or tuple(grid.shape) != (1, 3) or grid.device.type != "cpu":
+                raise ValueError("video_grid_thw must be a CPU torch.Tensor with shape [1, 3].")
+
+            fields_config = dict(qwen2_vl._create_qwen2vl_field_factory(self._spatial_merge_size)(data))
+            if "second_per_grid_ts" in data:
+                fields_config["second_per_grid_ts"] = MultiModalFieldConfig.batched("video")
+
+            return CudaStreamFusionPixelItems(data, fields_config)
+
+        return original(self, data)
+
+    parser_cls._parse_video_data = patched_parse_video_data
+    _QWEN_VLLM_ZERO_COPY_PATCH_INSTALLED = True
 
 
 if __name__ == "__main__":

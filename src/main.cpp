@@ -27,6 +27,17 @@ extern "C" cudaError_t csf_launch_yuv420p_to_rgb_float(
     cudaStream_t stream
 );
 
+extern "C" cudaError_t csf_launch_qwen_patchify(
+    const float* previous_rgb,
+    const float* current_rgb,
+    float* patches,
+    int width,
+    int height,
+    int grid_h,
+    int grid_w,
+    cudaStream_t stream
+);
+
 namespace py = pybind11;
 
 namespace {
@@ -168,15 +179,44 @@ py::capsule make_cuda_1d_float_capsule(
     return py::capsule(managed, "dltensor", capsule_destructor);
 }
 
+py::capsule make_cuda_2d_float_capsule(
+    float* data,
+    std::size_t rows,
+    std::size_t columns,
+    int device_id
+) {
+    auto* context = new TensorContext{};
+    context->shape[0] = static_cast<int64_t>(rows);
+    context->shape[1] = static_cast<int64_t>(columns);
+    context->strides[0] = static_cast<int64_t>(columns);
+    context->strides[1] = 1;
+
+    auto* managed = new DLManagedTensor{};
+    managed->dl_tensor.data = data;
+    managed->dl_tensor.device = DLDevice{kDLCUDA, device_id};
+    managed->dl_tensor.ndim = 2;
+    managed->dl_tensor.dtype = DLDataType{kDLFloat, 32, 1};
+    managed->dl_tensor.shape = context->shape;
+    managed->dl_tensor.strides = context->strides;
+    managed->dl_tensor.byte_offset = 0;
+    managed->manager_ctx = context;
+    managed->deleter = managed_tensor_deleter;
+
+    return py::capsule(managed, "dltensor", capsule_destructor);
+}
+
 }  // namespace dlpack_abi
 
 struct FrameSlot {
     std::uint8_t* yuv420p = nullptr;
     float* rgb = nullptr;
+    float* qwen_patches = nullptr;
     cudaStream_t stream = nullptr;
     std::uint64_t sequence = 0;
     bool has_decoded_frame = false;
     bool decode_pending = false;
+    bool has_qwen_patch = false;
+    bool qwen_patch_pending = false;
 };
 
 class UnifiedVideoRingBuffer {
@@ -189,6 +229,11 @@ public:
           yuv_bytes_(csf_yuv420p_frame_bytes(width, height)),
           rgb_bytes_(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) *
                      static_cast<std::size_t>(channels_) * sizeof(float)),
+          qwen_grid_h_(csf::qwen_patch_grid_dim(height)),
+          qwen_grid_w_(csf::qwen_patch_grid_dim(width)),
+          qwen_patch_rows_(csf::qwen_patch_rows(width, height)),
+          qwen_patch_bytes_(qwen_patch_rows_ * static_cast<std::size_t>(csf::kQwenPatchVectorSize) *
+                            sizeof(float)),
           slots_(static_cast<std::size_t>(capacity)) {
         if (width_ <= 0 || height_ <= 0) {
             throw std::invalid_argument("Frame width and height must be positive.");
@@ -196,7 +241,7 @@ public:
         if (capacity_ <= 0) {
             throw std::invalid_argument("Ring-buffer capacity must be positive.");
         }
-        if (yuv_bytes_ == 0 || rgb_bytes_ == 0) {
+        if (yuv_bytes_ == 0 || rgb_bytes_ == 0 || qwen_patch_bytes_ == 0) {
             throw std::invalid_argument("Computed frame allocation size is zero.");
         }
 
@@ -205,13 +250,16 @@ public:
         for (auto& slot : slots_) {
             void* yuv_ptr = nullptr;
             void* rgb_ptr = nullptr;
+            void* qwen_ptr = nullptr;
 
             CSF_CUDA_CHECK(cudaStreamCreateWithFlags(&slot.stream, cudaStreamNonBlocking));
             CSF_CUDA_CHECK(cudaMallocManaged(&yuv_ptr, yuv_bytes_));
             CSF_CUDA_CHECK(cudaMallocManaged(&rgb_ptr, rgb_bytes_));
+            CSF_CUDA_CHECK(cudaMallocManaged(&qwen_ptr, qwen_patch_bytes_));
 
             slot.yuv420p = static_cast<std::uint8_t*>(yuv_ptr);
             slot.rgb = static_cast<float*>(rgb_ptr);
+            slot.qwen_patches = static_cast<float*>(qwen_ptr);
 
             // The decoder or capture backend should write YUV directly into
             // this managed pointer. RGB is preferred on the GPU because PyTorch
@@ -219,9 +267,13 @@ public:
             CSF_CUDA_CHECK(cudaMemAdvise(slot.yuv420p, yuv_bytes_, cudaMemAdviseSetAccessedBy, device_id_));
             CSF_CUDA_CHECK(cudaMemAdvise(slot.rgb, rgb_bytes_, cudaMemAdviseSetPreferredLocation, device_id_));
             CSF_CUDA_CHECK(cudaMemAdvise(slot.rgb, rgb_bytes_, cudaMemAdviseSetAccessedBy, device_id_));
+            CSF_CUDA_CHECK(cudaMemAdvise(slot.qwen_patches, qwen_patch_bytes_, cudaMemAdviseSetPreferredLocation, device_id_));
+            CSF_CUDA_CHECK(cudaMemAdvise(slot.qwen_patches, qwen_patch_bytes_, cudaMemAdviseSetAccessedBy, device_id_));
             CSF_CUDA_CHECK(cudaMemsetAsync(slot.yuv420p, 0, yuv_bytes_, slot.stream));
             CSF_CUDA_CHECK(cudaMemsetAsync(slot.rgb, 0, rgb_bytes_, slot.stream));
+            CSF_CUDA_CHECK(cudaMemsetAsync(slot.qwen_patches, 0, qwen_patch_bytes_, slot.stream));
             CSF_CUDA_CHECK(cudaMemPrefetchAsync(slot.rgb, rgb_bytes_, device_id_, slot.stream));
+            CSF_CUDA_CHECK(cudaMemPrefetchAsync(slot.qwen_patches, qwen_patch_bytes_, device_id_, slot.stream));
             CSF_CUDA_CHECK(cudaStreamSynchronize(slot.stream));
         }
     }
@@ -241,6 +293,10 @@ public:
             if (slot.rgb != nullptr) {
                 cudaFree(slot.rgb);
                 slot.rgb = nullptr;
+            }
+            if (slot.qwen_patches != nullptr) {
+                cudaFree(slot.qwen_patches);
+                slot.qwen_patches = nullptr;
             }
             if (slot.stream != nullptr) {
                 cudaStreamDestroy(slot.stream);
@@ -291,11 +347,44 @@ public:
         );
     }
 
+    py::dict get_qwen_patch_tensor() {
+        float* data = nullptr;
+        py::dict info;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto& slot = slots_.at(read_index_);
+            if (slot.decode_pending || slot.qwen_patch_pending) {
+                CSF_CUDA_CHECK(cudaStreamSynchronize(slot.stream));
+                slot.decode_pending = false;
+                slot.qwen_patch_pending = false;
+            }
+            data = slot.qwen_patches;
+            info = qwen_patch_metadata_locked(read_index_);
+        }
+
+        py::dict bundle;
+        bundle["info"] = info;
+        bundle["capsule"] = dlpack_abi::make_cuda_2d_float_capsule(
+            data,
+            qwen_patch_rows_,
+            static_cast<std::size_t>(csf::kQwenPatchVectorSize),
+            device_id_
+        );
+        return bundle;
+    }
+
     py::dict decode_current(bool synchronize) {
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> lock(mutex_);
             auto& slot = slots_.at(write_index_);
+            const std::size_t previous_index = read_index_;
+            auto& previous_slot = slots_.at(previous_index);
+            if (previous_slot.has_decoded_frame && previous_slot.decode_pending) {
+                CSF_CUDA_CHECK(cudaStreamSynchronize(previous_slot.stream));
+                previous_slot.decode_pending = false;
+                previous_slot.qwen_patch_pending = false;
+            }
 
             CSF_CUDA_CHECK(cudaSetDevice(device_id_));
             CSF_CUDA_CHECK(csf_launch_yuv420p_to_rgb_float(
@@ -305,7 +394,20 @@ public:
                 height_,
                 slot.stream
             ));
+            const float* previous_rgb =
+                previous_slot.has_decoded_frame ? previous_slot.rgb : slot.rgb;
+            CSF_CUDA_CHECK(csf_launch_qwen_patchify(
+                previous_rgb,
+                slot.rgb,
+                slot.qwen_patches,
+                width_,
+                height_,
+                qwen_grid_h_,
+                qwen_grid_w_,
+                slot.stream
+            ));
             CSF_CUDA_CHECK(cudaMemPrefetchAsync(slot.rgb, rgb_bytes_, device_id_, slot.stream));
+            CSF_CUDA_CHECK(cudaMemPrefetchAsync(slot.qwen_patches, qwen_patch_bytes_, device_id_, slot.stream));
 
             if (synchronize) {
                 CSF_CUDA_CHECK(cudaStreamSynchronize(slot.stream));
@@ -313,7 +415,9 @@ public:
 
             slot.sequence = ++sequence_counter_;
             slot.has_decoded_frame = true;
+            slot.has_qwen_patch = true;
             slot.decode_pending = !synchronize;
+            slot.qwen_patch_pending = !synchronize;
             read_index_ = write_index_;
             write_index_ = (write_index_ + 1) % static_cast<std::size_t>(capacity_);
         }
@@ -370,6 +474,14 @@ public:
         return rgb_bytes_;
     }
 
+    std::size_t qwen_patch_bytes() const noexcept {
+        return qwen_patch_bytes_;
+    }
+
+    std::size_t qwen_patch_rows() const noexcept {
+        return qwen_patch_rows_;
+    }
+
 private:
     py::dict tensor_metadata_locked(std::size_t slot_index) const {
         const auto& slot = slots_.at(slot_index);
@@ -392,6 +504,37 @@ private:
         return info;
     }
 
+    py::dict qwen_patch_metadata_locked(std::size_t slot_index) const {
+        const auto& slot = slots_.at(slot_index);
+
+        py::dict info;
+        info["ptr"] = reinterpret_cast<std::uintptr_t>(slot.qwen_patches);
+        info["bytes"] = qwen_patch_bytes_;
+        info["rows"] = qwen_patch_rows_;
+        info["columns"] = csf::kQwenPatchVectorSize;
+        info["shape"] = py::make_tuple(qwen_patch_rows_, csf::kQwenPatchVectorSize);
+        info["strides"] = py::make_tuple(csf::kQwenPatchVectorSize, 1);
+        info["dtype"] = "float32";
+        info["device"] = "cuda:" + std::to_string(device_id_);
+        info["layout"] = "qwen2.5-vl-video-pixel-values";
+        info["grid_t"] = 1;
+        info["grid_h"] = qwen_grid_h_;
+        info["grid_w"] = qwen_grid_w_;
+        info["patch_size"] = csf::kQwenPatchSize;
+        info["temporal_patch_size"] = csf::kQwenTemporalPatchSize;
+        info["spatial_merge_size"] = csf::kQwenSpatialMergeSize;
+        info["source_width"] = width_;
+        info["source_height"] = height_;
+        info["padded_width"] = qwen_grid_w_ * csf::kQwenPatchSize;
+        info["padded_height"] = qwen_grid_h_ * csf::kQwenPatchSize;
+        info["normalization"] = "openai_clip_mean_std";
+        info["slot"] = static_cast<int>(slot_index);
+        info["sequence"] = slot.sequence;
+        info["has_qwen_patch"] = slot.has_qwen_patch;
+        info["ownership"] = "cudaMallocManaged";
+        return info;
+    }
+
     static constexpr int channels_ = 3;
     int width_;
     int height_;
@@ -399,6 +542,10 @@ private:
     int device_id_;
     std::size_t yuv_bytes_;
     std::size_t rgb_bytes_;
+    int qwen_grid_h_;
+    int qwen_grid_w_;
+    std::size_t qwen_patch_rows_;
+    std::size_t qwen_patch_bytes_;
     mutable std::mutex mutex_;
     std::vector<FrameSlot> slots_;
     std::size_t write_index_ = 0;
@@ -725,6 +872,8 @@ PYBIND11_MODULE(fusion_core, module) {
              "Return metadata for the latest decoded RGB float32 CUDA tensor backing store.")
         .def("to_dlpack", &UnifiedVideoRingBuffer::to_dlpack,
              "Return a single-use DLPack capsule for zero-copy torch tensor construction.")
+        .def("get_qwen_patch_tensor", &UnifiedVideoRingBuffer::get_qwen_patch_tensor,
+             "Return DLPack capsule plus metadata for Qwen2.5-VL CUDA patch rows.")
         .def("decode_current", &UnifiedVideoRingBuffer::decode_current,
              py::arg("synchronize") = true,
              "Decode the current YUV420p ring slot into RGB float32 and advance the ring.")
@@ -737,7 +886,9 @@ PYBIND11_MODULE(fusion_core, module) {
         .def_property_readonly("height", &UnifiedVideoRingBuffer::height)
         .def_property_readonly("channels", &UnifiedVideoRingBuffer::channels)
         .def_property_readonly("yuv_bytes", &UnifiedVideoRingBuffer::yuv_bytes)
-        .def_property_readonly("rgb_bytes", &UnifiedVideoRingBuffer::rgb_bytes);
+        .def_property_readonly("rgb_bytes", &UnifiedVideoRingBuffer::rgb_bytes)
+        .def_property_readonly("qwen_patch_bytes", &UnifiedVideoRingBuffer::qwen_patch_bytes)
+        .def_property_readonly("qwen_patch_rows", &UnifiedVideoRingBuffer::qwen_patch_rows);
 
     py::class_<UnifiedAudioRingBuffer>(module, "AudioStreamCore")
         .def(py::init<int, int, int>(),
@@ -827,6 +978,12 @@ PYBIND11_MODULE(fusion_core, module) {
             return require_global_core().to_dlpack();
         },
         "Return a single-use DLPack capsule for the latest global RGB frame.");
+
+    module.def("get_qwen_patch_tensor",
+        []() {
+            return require_global_core().get_qwen_patch_tensor();
+        },
+        "Return DLPack capsule plus metadata for the latest global Qwen2.5-VL video patch tensor.");
 
     module.def("decode_current",
         [](bool synchronize) {
