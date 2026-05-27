@@ -2,10 +2,16 @@
 
 `cuda-stream-fusion` is a bare-metal, local, zero-copy multi-modal streaming
 ingestion engine designed to move live video and audio streams into CUDA-backed
-deep learning models with minimal Python involvement. The current reference
-target is **Ubuntu 24.04 LTS**, an **NVIDIA RTX 4090 Laptop GPU with 16 GB
+deep learning models with minimal Python involvement. The validated reference
+platform is **Ubuntu 24.04 LTS**, an **NVIDIA RTX 4090 Laptop GPU with 16 GB
 VRAM**, and an **Intel i9-14900HX** CPU running inside an isolated Micromamba
 environment named `mmsf`.
+
+The core CUDA pipeline is intended to be portable across NVIDIA CUDA-capable
+GPUs. The reference numbers, memory budget, and default build flags are tuned
+for the RTX 4090 Laptop GPU. Other NVIDIA cards should work when the CUDA
+architecture, CUDA Toolkit/PyTorch compatibility pair, VRAM budget, and model
+size are adjusted for that machine.
 
 The project is intentionally narrow: it is not a general media framework, a
 web-serving stack, or a codec distribution. It is a low-level infrastructure
@@ -230,9 +236,31 @@ The CMake project:
 - Requires modern CMake and C++20.
 - Finds Python and pybind11 under the `mmsf` prefix.
 - Links against the NVIDIA CUDA Toolkit.
-- Builds CUDA kernels for Ada Lovelace with `CUDA_ARCHITECTURES=89`, equivalent
-  to targeting `sm_89` for the RTX 4090 Laptop GPU.
+- Builds CUDA kernels for Ada Lovelace by default with
+  `CUDA_ARCHITECTURES=89`, equivalent to targeting `sm_89` for the RTX 4090
+  Laptop GPU.
 - Emits the compiled pybind11 extension into `fusion_engine/`.
+
+For another NVIDIA GPU, override the architecture at configure time:
+
+```bash
+cmake \
+  -DMMSF_PREFIX="$MMSF_PREFIX" \
+  -DCMAKE_PREFIX_PATH="$MMSF_PREFIX" \
+  -DCMAKE_CUDA_ARCHITECTURES=86 \
+  ..
+```
+
+Common examples:
+
+```text
+86 = NVIDIA Ampere, such as many RTX 30-series cards
+89 = NVIDIA Ada Lovelace, such as many RTX 40-series cards
+90 = NVIDIA Hopper, such as H100-class datacenter GPUs
+```
+
+The CPU is not hard-coded. More cores help synthetic ingest, build throughput,
+and model-side orchestration, but the hot media transform path is CUDA-bound.
 
 ### 3. Build
 
@@ -403,10 +431,12 @@ print(outputs[0].outputs[0].text)
 
 ## REALISTIC TECHNICAL LIMITATIONS & EDGE CASES
 
-### 16 GB VRAM Is a Hard Boundary
+### VRAM Budget Is the Practical Boundary
 
 The validated platform has approximately 16 GB physical VRAM. That is tight for
-modern vision-language models.
+modern vision-language models, so the default vLLM settings are deliberately
+conservative. Larger NVIDIA GPUs can raise model size, context length,
+resolution, or `gpu_memory_utilization`; smaller GPUs usually need the opposite.
 
 Observed behavior:
 
@@ -422,8 +452,8 @@ Observed behavior:
   - a smaller model,
   - or more VRAM.
 
-For strict local GPU-only inference on this hardware, expect sub-7B models or
-quantized checkpoints to be the practical operating range.
+For strict local GPU-only inference on the validated 16 GB hardware, expect
+sub-7B models or quantized checkpoints to be the practical operating range.
 
 ### First-Cycle Triton JIT Latency
 
